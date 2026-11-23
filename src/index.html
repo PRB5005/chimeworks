@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>ChimeWorks — 32-Bit Edition</title>
+  <style>
+    :root {
+      --cw-bg: #121016;      /* Deep vinyl obsidian: canvas backdrop, chamber cavities, dark ink on filled controls. */
+      --cw-surface: #3D333A; /* Smoked walnut-slate: chassis, transport bar, drawer panels, unlit frames. */
+      --cw-ink: #F2ECE1;     /* Warm parchment ivory: typography, odometer digits, 1px borders, idle outlines. */
+      --cw-accent: #E5A93C;  /* Brushed brass: Playing/Tweaking active frame, locked pinheads, droplets, live waveform. */
+      --cw-active: #4CD4A9;  /* Studio phosphor verdigris: Encoding MP3 groove (outline) and Download Complete (solid fill). */
+    }
+
+    * {
+      box-sizing: border-box;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: var(--cw-bg);
+      color: var(--cw-ink);
+      font-family: ui-monospace, "Cascadia Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.25;
+      overflow: hidden;
+    }
+
+    #app {
+      display: flex;
+      flex-direction: column;
+      width: 100%;
+      height: 100%;
+      background: var(--cw-bg);
+    }
+
+    /* ---------- Top Bar ---------- */
+    #top-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 6px 10px;
+      background: var(--cw-surface);
+      border-bottom: 1px solid var(--cw-ink);
+      flex-shrink: 0;
+      min-height: 52px;
+    }
+
+    .bar-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    /* 3-digit rolling brass odometer */
+    #odometer {
+      display: inline-flex;
+      background: var(--cw-bg);
+      border: 1px solid var(--cw-ink);
+      padding: 2px 3px;
+      gap: 2px;
+      flex-shrink: 0;
+    }
+
+    body:not([data-state="idle"]) #odometer {
+      border-color: var(--cw-accent);
+    }
+
+    .odo-drum {
+      width: 14px;
+      height: 22px;
+      overflow: hidden;
+      position: relative;
+      background: var(--cw-bg);
+      border-right: 1px solid rgba(242, 236, 225, 0.25);
+    }
+    .odo-drum:last-child {
+      border-right: none;
+    }
+    .odo-strip {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .odo-strip span {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 22px;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--cw-ink);
+    }
+
+    /* Breadcrumb trail */
+    #breadcrumbs {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      overflow-x: auto;
+      scrollbar-width: none;
+      max-width: 240px;
+    }
+    #breadcrumbs::-webkit-scrollbar { display: none; }
+
+    .crumb-btn {
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      background: var(--cw-bg);
+      border: 1px solid var(--cw-ink);
+      cursor: pointer;
+      flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .crumb-btn canvas {
+      width: 24px;
+      height: 24px;
+      image-rendering: pixelated;
+      display: block;
+    }
+    .crumb-btn:hover {
+      border-color: var(--cw-accent);
+    }
+
+    /* Controls */
+    .cw-btn {
+      appearance: none;
+      background: var(--cw-bg);
+      color: var(--cw-ink);
+      border: 1px solid var(--cw-ink);
+      padding: 6px 10px;
+      min-height: 36px;
+      font-family: inherit;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+
+    .cw-btn:active {
+      transform: translateY(1px);
+    }
+
+    .cw-btn.lit {
+      background: var(--cw-accent);
+      color: var(--cw-bg);
+      border-color: var(--cw-accent);
+    }
+
+    body[data-state="idle"] .cw-btn.lit {
+      background: var(--cw-bg);
+      color: var(--cw-ink);
+      border-color: var(--cw-ink);
+    }
+
+    /* Press to Vinyl deck */
+    .vinyl-deck {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    #vinyl-platter {
+      width: 38px;
+      height: 38px;
+      image-rendering: pixelated;
+      display: block;
+      flex-shrink: 0;
+    }
+
+    #vinyl-btn[data-mode="encoding"] {
+      border-color: var(--cw-active);
+      color: var(--cw-active);
+      background: var(--cw-bg);
+      cursor: wait;
+    }
+
+    #vinyl-btn[data-mode="complete"] {
+      background: var(--cw-active);
+      color: var(--cw-bg);
+      border-color: var(--cw-active);
+    }
+
+    /* ---------- Main 1+4 Chamber Grid ---------- */
+    #stage {
+      flex: 1 1 auto;
+      min-height: 0;
+      padding: 8px;
+      display: flex;
+      align-items: stretch;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    #chamber-grid {
+      width: 100%;
+      height: 100%;
+      max-width: 1440px;
+      display: grid;
+      gap: 8px;
+      /* Landscape default: 2 | 1 | 2 */
+      grid-template-columns: 1fr 1.55fr 1fr;
+      grid-template-rows: 1fr 1fr;
+      grid-template-areas:
+        "off0 parent off2"
+        "off1 parent off3";
+    }
+
+    /* Portrait reflow: 1 over 2x2 */
+    @media (max-aspect-ratio: 1/1) {
+      #chamber-grid {
+        grid-template-columns: 1fr 1fr;
+        grid-template-rows: 1.35fr 1fr 1fr;
+        grid-template-areas:
+          "parent parent"
+          "off0 off1"
+          "off2 off3";
+      }
+      #breadcrumbs {
+        max-width: 110px;
+      }
+    }
+
+    .chamber-frame {
+      position: relative;
+      background: var(--cw-surface);
+      border: 1px solid var(--cw-ink);
+      padding: 6px;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      transition: transform 120ms ease, border-color 120ms ease;
+    }
+
+    .chamber-frame[data-slot="parent"] { grid-area: parent; }
+    .chamber-frame[data-slot="0"] { grid-area: off0; }
+    .chamber-frame[data-slot="1"] { grid-area: off1; }
+    .chamber-frame[data-slot="2"] { grid-area: off2; }
+    .chamber-frame[data-slot="3"] { grid-area: off3; }
+
+    /* Active soloed frame */
+    body:not([data-state="idle"]) .chamber-frame.soloed {
+      border-color: var(--cw-accent);
+      box-shadow: inset 0 0 0 1px var(--cw-accent);
+    }
+
+    /* Offspring elevates 2px when soloed */
+    .chamber-frame.offspring.soloed {
+      transform: translateY(-2px);
+    }
+
+    .chamber-frame.drop-target {
+      border-color: var(--cw-active);
+      box-shadow: inset 0 0 0 2px var(--cw-active);
+    }
+
+    .chamber-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px;
+      margin-bottom: 4px;
+      flex-shrink: 0;
+    }
+
+    .niche-label {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--cw-ink);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .offspring-chevron {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 1px 5px;
+      font-size: 10px;
+      font-weight: 700;
+      background: var(--cw-accent);
+      color: var(--cw-bg);
+      letter-spacing: 0.04em;
+    }
+
+    body:not([data-state="idle"]) .chamber-frame.offspring.soloed .offspring-chevron {
+      display: inline-flex;
+    }
+
+    .canvas-cavity {
+      position: relative;
+      flex: 1 1 auto;
+      min-height: 0;
+      background: var(--cw-bg);
+      border: 1px solid var(--cw-ink);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      touch-action: none;
+    }
+
+    .chamber-canvas {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      image-rendering: pixelated;
+      display: block;
+      touch-action: none;
+    }
+
+    /* Parent Layer LED Controls */
+    .parent-controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      margin-top: 6px;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    .led-group {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .led-switch {
+      appearance: none;
+      background: var(--cw-bg);
+      color: var(--cw-ink);
+      border: 1px solid var(--cw-ink);
+      padding: 5px 8px;
+      min-height: 32px;
+      min-width: 56px;
+      font-family: inherit;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+    }
+
+    .led-pip {
+      width: 7px;
+      height: 7px;
+      border: 1px solid var(--cw-ink);
+      background: var(--cw-bg);
+      display: inline-block;
+    }
+
+    /* Active LED: lit --cw-accent with --cw-bg glyph */
+    body:not([data-state="idle"]) .led-switch[data-mode="active"] {
+      background: var(--cw-accent);
+      color: var(--cw-bg);
+      border-color: var(--cw-accent);
+    }
+    body:not([data-state="idle"]) .led-switch[data-mode="active"] .led-pip {
+      background: var(--cw-bg);
+      border-color: var(--cw-bg);
+    }
+
+    /* Muted LED: --cw-bg */
+    .led-switch[data-mode="muted"] {
+      background: var(--cw-bg);
+      color: var(--cw-ink);
+      opacity: 0.6;
+    }
+
+    /* Locked LED: brass collar */
+    body:not([data-state="idle"]) .led-switch[data-mode="locked"] {
+      background: var(--cw-surface);
+      color: var(--cw-accent);
+      border: 2px solid var(--cw-accent);
+    }
+    body:not([data-state="idle"]) .led-switch[data-mode="locked"] .led-pip {
+      background: var(--cw-accent);
+      border-color: var(--cw-bg);
+    }
+
+    /* ---------- Bottom Drawer ---------- */
+    #drawer {
+      background: var(--cw-surface);
+      border-top: 1px solid var(--cw-ink);
+      flex-shrink: 0;
+    }
+
+    #drawer-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 4px 10px;
+      gap: 8px;
+      min-height: 36px;
+    }
+
+    #drawer-body {
+      display: none;
+      padding: 8px 10px 10px;
+      border-top: 1px solid var(--cw-ink);
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    #drawer.open #drawer-body {
+      display: flex;
+    }
+
+    #commissions-list {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .comm-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 8px;
+      background: var(--cw-bg);
+      border: 1px solid var(--cw-ink);
+      font-size: 10px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    body:not([data-state="idle"]) .comm-item.done {
+      background: var(--cw-accent);
+      color: var(--cw-bg);
+      border-color: var(--cw-accent);
+      font-weight: 700;
+    }
+
+    .drawer-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    /* Blueprint Ghost Overlay */
+    #ghost-overlay {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 50;
+      image-rendering: pixelated;
+    }
+
+    #import-file {
+      display: none;
+    }
+  </style>
+</head>
+<body data-state="idle">
+  <div id="app">
+    <header id="top-bar">
+      <div class="bar-group">
+        <div id="odometer" aria-label="Generation">
+          <div class="odo-drum"><div class="odo-strip" id="odo-0"><span>0</span><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span></div></div>
+          <div class="odo-drum"><div class="odo-strip" id="odo-1"><span>0</span><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span></div></div>
+          <div class="odo-drum"><div class="odo-strip" id="odo-2"><span>0</span><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span></div></div>
+        </div>
+        <nav id="breadcrumbs" aria-label="History"></nav>
+      </div>
+
+      <div class="bar-group">
+        <button id="tempo-dial" class="cw-btn" type="button">1×</button>
+        <button id="power-btn" class="cw-btn" type="button">PWR</button>
+        <div class="vinyl-deck">
+          <canvas id="vinyl-platter" width="76" height="76"></canvas>
+          <button id="vinyl-btn" class="cw-btn" type="button" data-mode="ready">Press to Vinyl</button>
+        </div>
+      </div>
+    </header>
+
+    <main id="stage">
+      <section id="chamber-grid">
+        <article class="chamber-frame soloed" data-slot="parent">
+          <div class="chamber-head">
+            <span class="niche-label">PARENT</span>
+            <div class="led-group">
+              <button id="scale-btn" class="cw-btn" style="min-height:24px;padding:2px 6px;" type="button">PENT</button>
+              <button id="mutate-btn" class="cw-btn" style="min-height:24px;padding:2px 8px;" type="button">MUTATE</button>
+            </div>
+          </div>
+          <div class="canvas-cavity">
+            <canvas id="canvas-parent" class="chamber-canvas" width="320" height="320"></canvas>
+          </div>
+          <div class="parent-controls">
+            <div class="led-group">
+              <button id="led-bass" class="led-switch" data-layer="bass" data-mode="active" type="button"><span class="led-pip"></span>BASS</button>
+              <button id="led-perc" class="led-switch" data-layer="perc" data-mode="active" type="button"><span class="led-pip"></span>PERC</button>
+              <button id="led-mel" class="led-switch" data-layer="mel" data-mode="active" type="button"><span class="led-pip"></span>MEL</button>
+            </div>
+            <span id="genome-bytes" class="niche-label">000B</span>
+          </div>
+        </article>
+
+        <article class="chamber-frame offspring" data-slot="0">
+          <div class="chamber-head">
+            <span class="niche-label">SPARSE AMBIENT</span>
+            <span class="offspring-chevron">▲ PROMOTE</span>
+          </div>
+          <div class="canvas-cavity">
+            <canvas id="canvas-off-0" class="chamber-canvas" width="320" height="320"></canvas>
+          </div>
+        </article>
+
+        <article class="chamber-frame offspring" data-slot="1">
+          <div class="chamber-head">
+            <span class="niche-label">FAST POLYRHYTHM</span>
+            <span class="offspring-chevron">▲ PROMOTE</span>
+          </div>
+          <div class="canvas-cavity">
+            <canvas id="canvas-off-1" class="chamber-canvas" width="320" height="320"></canvas>
+          </div>
+        </article>
+
+        <article class="chamber-frame offspring" data-slot="2">
+          <div class="chamber-head">
+            <span class="niche-label">PERCUSSIVE</span>
+            <span class="offspring-chevron">▲ PROMOTE</span>
+          </div>
+          <div class="canvas-cavity">
+            <canvas id="canvas-off-2" class="chamber-canvas" width="320" height="320"></canvas>
+          </div>
+        </article>
+
+        <article class="chamber-frame offspring" data-slot="3">
+          <div class="chamber-head">
+            <span class="niche-label">MELODIC</span>
+            <span class="offspring-chevron">▲ PROMOTE</span>
+          </div>
+          <div class="canvas-cavity">
+            <canvas id="canvas-off-3" class="chamber-canvas" width="320" height="320"></canvas>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <footer id="drawer">
+      <div id="drawer-bar">
+        <div id="commissions-summary" class="niche-label">COMMISSIONS 0/4</div>
+        <button id="drawer-toggle" class="cw-btn" style="min-height:26px;padding:2px 8px;" type="button">DRAWER ▲</button>
+      </div>
+      <div id="drawer-body">
+        <div id="commissions-list">
+          <div class="comm-item" data-comm="chimes">CHIMES · MUTATE</div>
+          <div class="comm-item" data-comm="marimba">MARIMBA · LOCK LAYER</div>
+          <div class="comm-item" data-comm="fmBass">FM BASS · CROSS-POLLINATE</div>
+          <div class="comm-item" data-comm="percussion">PERCUSSION · PROMOTE GEN 003</div>
+        </div>
+        <div class="drawer-actions">
+          <button id="copy-url-btn" class="cw-btn" type="button">Copy Share URL</button>
+          <button id="export-btn" class="cw-btn" type="button">Export File</button>
+          <button id="import-btn" class="cw-btn" type="button">Import File</button>
+          <input id="import-file" type="file" accept=".json,application/json" />
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <canvas id="ghost-overlay"></canvas>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
