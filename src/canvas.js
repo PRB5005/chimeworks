@@ -1,4 +1,9 @@
 // ChimeWorks (32-Bit Edition) — Procedural Double-Resolution Pixel-Art Renderer
+// Upgrades: Live dotted trajectory aiming arcs, distinct layer silhouettes
+// (Square = BASS, Diamond = PERC, Circle = MEL), floating pitch/drum badges,
+// active 4-bar chord indicator, and edge-delete visual cue.
+
+import { getNoteNameForY } from './audio.js';
 
 export const COLORS = {
   bg: '#121016',
@@ -12,9 +17,20 @@ const WORLD_SIZE = 160;
 const CANVAS_SIZE = 320; // Double-resolution pixel art (2px per physics unit)
 const SCALE = CANVAS_SIZE / WORLD_SIZE;
 const LAYER_KEYS = ['b', 'p', 'm'];
+const LAYER_TAGS = ['BASS', 'PERC', 'MEL'];
+const DRUM_NAMES = ['KICK', 'RIM', 'SNARE', 'HAT'];
+
+// Trajectory buffer layout matching wasm/physics.rs
+const TRAJ_MAX_PTS = 90;
+const TRAJ_LAYER_STRIDE = 1 + TRAJ_MAX_PTS * 2; // 181 f32s per layer
 
 function px(v) {
   return Math.round(v * SCALE);
+}
+
+function spatialPitchFromY(y) {
+  const norm = 1 - Math.max(0, Math.min(1, (y - 16) / 128));
+  return Math.max(0, Math.min(14, Math.floor(norm * 14 + 0.5)));
 }
 
 function drawPixelCircle(ctx, cx, cy, r, fill, stroke) {
@@ -31,11 +47,74 @@ function drawPixelCircle(ctx, cx, cy, r, fill, stroke) {
   }
 }
 
+function drawPixelSquare(ctx, cx, cy, r, fill, stroke) {
+  const x = Math.round(cx - r);
+  const y = Math.round(cy - r);
+  const w = Math.round(r * 2);
+  if (fill) {
+    ctx.fillStyle = fill;
+    ctx.fillRect(x, y, w, w);
+  }
+  if (stroke) {
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y, w, w);
+  }
+}
+
+function drawPixelDiamond(ctx, cx, cy, r, fill, stroke) {
+  const x = Math.round(cx);
+  const y = Math.round(cy);
+  const rad = Math.round(r * 1.15);
+  ctx.beginPath();
+  ctx.moveTo(x, y - rad);
+  ctx.lineTo(x + rad, y);
+  ctx.lineTo(x, y + rad);
+  ctx.lineTo(x - rad, y);
+  ctx.closePath();
+  if (fill) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+  if (stroke) {
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+}
+
+function drawLayerShape(ctx, layerIdx, cx, cy, r, fill, stroke) {
+  if (layerIdx === 0) {
+    drawPixelSquare(ctx, cx, cy, r, fill, stroke);
+  } else if (layerIdx === 1) {
+    drawPixelDiamond(ctx, cx, cy, r, fill, stroke);
+  } else {
+    drawPixelCircle(ctx, cx, cy, r, fill, stroke);
+  }
+}
+
 function drawPinhead(ctx, x, y, color) {
   ctx.fillStyle = color;
   ctx.fillRect(Math.round(x - 3), Math.round(y - 3), 6, 6);
   ctx.fillStyle = COLORS.bg;
   ctx.fillRect(Math.round(x - 1), Math.round(y - 1), 2, 2);
+}
+
+function drawBadge(ctx, cx, cy, text, bg, fg) {
+  ctx.font = 'bold 12px ui-monospace, Menlo, Consolas, monospace';
+  const metrics = ctx.measureText(text);
+  const padX = 5;
+  const bw = Math.ceil(metrics.width) + padX * 2;
+  const bh = 18;
+  const bx = Math.max(4, Math.min(CANVAS_SIZE - bw - 4, Math.round(cx - bw / 2)));
+  const by = Math.max(4, Math.min(CANVAS_SIZE - bh - 4, Math.round(cy - bh / 2)));
+
+  ctx.fillStyle = bg;
+  ctx.fillRect(bx, by, bw, bh);
+  ctx.fillStyle = fg;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  ctx.fillText(text, bx + padX, by + bh / 2 + 1);
 }
 
 export function hitTestChamber(canvas, clientX, clientY, genome, selectedPart) {
@@ -127,14 +206,19 @@ export function renderChamber(canvas, opts) {
     genome,
     isIdle,
     isSoloed,
-    layerModes, // { bass, perc, mel } -> 'active' | 'muted' | 'locked'
-    droplets,   // live Float32Array (stride 8) or null
-    keyframes,  // offline Float32Array (stride 49) or null
-    kfFrame,    // integer frame index for idle keyframes
-    barcode,    // Float32Array(16) or null
-    bellFlashes,// Map<flatPartIdx, remainingFrames>
-    selectedPart,
-    oscData,    // Uint8Array(128) or null
+    layerModes,   // { bass, perc, mel } -> 'active' | 'muted' | 'locked'
+    activeLayer,  // optional 'b' | 'p' | 'm' highlighted when editing
+    droplets,     // live Float32Array (stride 8) or null
+    keyframes,    // offline Float32Array (stride 49) or null
+    kfFrame,      // integer frame index for idle keyframes
+    barcode,      // Float32Array(16) or null
+    trajectories, // Float32Array(543) from trace_trajectories or null
+    bellFlashes,  // Map<flatPartIdx, remainingFrames>
+    selectedPart, // { layerKey, isEmitter, index } or null
+    isDragging,   // boolean: true while actively dragging a part
+    dragDeleting, // boolean: true when dragged to edge for deletion
+    chordName,    // string (e.g., 'Cmaj9') or null
+    oscData,      // Uint8Array(128) or null
   } = opts;
 
   const accentColor = isIdle ? COLORS.ink : COLORS.accent;
@@ -155,21 +239,55 @@ export function renderChamber(canvas, opts) {
     ctx.fillRect(0, gy, CANVAS_SIZE, 1);
   }
 
+  // Edge-delete frame cue when dragging a non-emitter part near canvas border
+  if (dragDeleting && isSoloed && !isIdle) {
+    ctx.strokeStyle = COLORS.accent;
+    ctx.lineWidth = 4;
+    ctx.setLineDash([6, 6]);
+    ctx.strokeRect(4, 4, CANVAS_SIZE - 8, CANVAS_SIZE - 8);
+    ctx.setLineDash([]);
+    drawBadge(ctx, CANVAS_SIZE / 2, 16, 'RELEASE TO DELETE', COLORS.accent, COLORS.bg);
+  }
+
   const modeArr = [
     layerModes ? layerModes.bass : 'active',
     layerModes ? layerModes.perc : 'active',
     layerModes ? layerModes.mel : 'active',
   ];
 
+  // Live Dotted Trajectory Aiming Arcs (soloed chamber only)
+  if (isSoloed && trajectories && trajectories.length >= 3 * TRAJ_LAYER_STRIDE) {
+    const focusLayer = selectedPart ? selectedPart.layerKey : activeLayer;
+    for (let li = 0; li < 3; li++) {
+      if (modeArr[li] === 'muted') continue;
+      const base = li * TRAJ_LAYER_STRIDE;
+      const count = Math.min(TRAJ_MAX_PTS, Math.floor(trajectories[base]));
+      if (count < 2) continue;
+
+      const isFocused = focusLayer === LAYER_KEYS[li];
+      ctx.fillStyle = isFocused && !isIdle
+        ? 'rgba(229, 169, 60, 0.55)'
+        : 'rgba(242, 236, 225, 0.16)';
+
+      const dotSize = isFocused ? 3 : 2;
+      for (let i = 0; i < count; i += 2) {
+        const tx = px(trajectories[base + 1 + i * 2]);
+        const ty = px(trajectories[base + 1 + i * 2 + 1]);
+        ctx.fillRect(Math.round(tx - dotSize / 2), Math.round(ty - dotSize / 2), dotSize, dotSize);
+      }
+    }
+  }
+
   let flatPartIdx = 0;
 
-  // Draw emitters and parts per layer
+  // Draw emitters and parts per layer with distinct layer silhouettes
   for (let li = 0; li < 3; li++) {
     const lk = LAYER_KEYS[li];
     const layer = genome[lk];
     const lMode = modeArr[li];
     const layerMuted = lMode === 'muted';
     const layerLocked = lMode === 'locked' && !isIdle;
+    const isSelectedLayer = selectedPart && selectedPart.layerKey === lk;
 
     // Emitter
     const e = layer.e;
@@ -177,25 +295,24 @@ export function renderChamber(canvas, opts) {
     const ey = px(e[1]);
     const erad = (e[2] * Math.PI) / 180;
     const emMuted = layerMuted || e[5] === 1;
+    const emStroke = emMuted ? COLORS.surface : (isSoloed ? accentColor : COLORS.ink);
 
-    ctx.strokeStyle = emMuted ? COLORS.surface : (isSoloed ? accentColor : COLORS.ink);
-    ctx.lineWidth = 2;
-    ctx.fillStyle = COLORS.bg;
-    ctx.fillRect(ex - 7, ey - 7, 14, 14);
-    ctx.strokeRect(ex - 7, ey - 7, 14, 14);
+    drawLayerShape(ctx, li, ex, ey, 7, COLORS.bg, emStroke);
 
     // Nozzle direction
+    ctx.strokeStyle = emStroke;
+    ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(ex, ey);
-    ctx.lineTo(Math.round(ex + Math.cos(erad) * 12), Math.round(ey + Math.sin(erad) * 12));
+    ctx.lineTo(Math.round(ex + Math.cos(erad) * 13), Math.round(ey + Math.sin(erad) * 13));
     ctx.stroke();
 
-    // Idle state: droplets poised at emitters
+    // Idle state: droplets poised at emitters (strictly --cw-ink)
     if (isIdle && !emMuted) {
-      drawPixelCircle(ctx, ex + Math.cos(erad) * 12, ey + Math.sin(erad) * 12, 4, COLORS.ink, null);
+      drawLayerShape(ctx, li, ex + Math.cos(erad) * 13, ey + Math.sin(erad) * 13, 3.5, COLORS.ink, null);
     }
     if (layerLocked) {
-      drawPinhead(ctx, ex - 7, ey - 7, COLORS.accent);
+      drawPinhead(ctx, ex - 8, ey - 8, COLORS.accent);
     }
 
     // Parts
@@ -208,35 +325,41 @@ export function renderChamber(canvas, opts) {
       const size = px(p[4]);
       const pMuted = layerMuted || p[6] === 1;
       const flash = bellFlashes ? (bellFlashes.get(flatPartIdx) || 0) : 0;
+      const isThisSelected = isSelectedLayer && !selectedPart.isEmitter && selectedPart.index === pi;
 
       if (kind === 0) {
-        // Ramp
+        // Ramp with end-caps indicating its layer
         const dx = Math.cos(rad) * size;
         const dy = Math.sin(rad) * size;
-        ctx.strokeStyle = pMuted ? COLORS.surface : COLORS.ink;
+        ctx.strokeStyle = pMuted ? COLORS.surface : (isThisSelected && !isIdle ? COLORS.accent : COLORS.ink);
         ctx.lineWidth = 4;
         ctx.beginPath();
         ctx.moveTo(Math.round(x - dx), Math.round(y - dy));
         ctx.lineTo(Math.round(x + dx), Math.round(y + dy));
         ctx.stroke();
+        // End pins
+        ctx.fillStyle = pMuted ? COLORS.surface : accentColor;
+        ctx.fillRect(Math.round(x - dx) - 2, Math.round(y - dy) - 2, 4, 4);
+        ctx.fillRect(Math.round(x + dx) - 2, Math.round(y + dy) - 2, 4, 4);
       } else if (kind === 1) {
-        // Bumper
-        const stroke = pMuted ? COLORS.surface : (flash > 0 ? COLORS.ink : (isSoloed ? accentColor : COLORS.ink));
-        const fill = flash > 0 ? COLORS.ink : COLORS.surface;
-        drawPixelCircle(ctx, x, y, size, fill, stroke);
-        drawPixelCircle(ctx, x, y, Math.max(3, size * 0.4), COLORS.bg, null);
+        // Bumper (percussive diamond/layer shape with inner core)
+        const isFlashing = flash > 0 && !isIdle;
+        const stroke = pMuted ? COLORS.surface : (isFlashing ? COLORS.ink : (isSoloed ? accentColor : COLORS.ink));
+        const fill = isFlashing ? COLORS.ink : COLORS.surface;
+        drawLayerShape(ctx, li, x, y, size, fill, stroke);
+        drawLayerShape(ctx, li, x, y, Math.max(3, size * 0.42), COLORS.bg, null);
       } else if (kind === 2) {
-        // Teleporter
+        // Teleporter (nested verdigris frame)
         ctx.strokeStyle = pMuted ? COLORS.surface : (isIdle ? COLORS.ink : COLORS.active);
         ctx.lineWidth = 2;
         ctx.strokeRect(x - size, y - size, size * 2, size * 2);
         ctx.strokeRect(x - Math.round(size * 0.5), y - Math.round(size * 0.5), size, size);
       } else if (kind === 3) {
-        // Bell — 2-frame #F2ECE1 flash on hit
+        // Bell — distinct silhouette per layer + 2-frame #F2ECE1 flash on hit
         const isFlashing = flash > 0 && !isIdle;
         const fill = isFlashing ? COLORS.ink : (pMuted ? COLORS.bg : COLORS.surface);
         const stroke = pMuted ? COLORS.surface : (isFlashing ? COLORS.ink : (isSoloed ? accentColor : COLORS.ink));
-        drawPixelCircle(ctx, x, y, size, fill, stroke);
+        drawLayerShape(ctx, li, x, y, size, fill, stroke);
         if (!pMuted && !isFlashing) {
           ctx.fillStyle = isSoloed ? accentColor : COLORS.ink;
           ctx.fillRect(x - 2, y - 2, 4, 4);
@@ -257,9 +380,10 @@ export function renderChamber(canvas, opts) {
       for (let i = 0; i < 48; i++) {
         const b = i * 8;
         if (droplets[b] < 0.5) continue;
+        const dLayer = Math.round(droplets[b + 1]);
         const dx = px(droplets[b + 2]);
         const dy = px(droplets[b + 3]);
-        drawPixelCircle(ctx, dx, dy, 5, COLORS.accent, COLORS.bg);
+        drawLayerShape(ctx, dLayer, dx, dy, 4.5, COLORS.accent, COLORS.bg);
       }
     } else if (!isSoloed && keyframes && keyframes.length >= 49) {
       const f = (kfFrame || 0) % 60;
@@ -267,39 +391,85 @@ export function renderChamber(canvas, opts) {
       const cnt = Math.min(16, Math.floor(keyframes[base]));
       for (let i = 0; i < cnt; i++) {
         const off = base + 1 + i * 3;
+        const dLayer = Math.round(keyframes[off]);
         const dx = px(keyframes[off + 1]);
         const dy = px(keyframes[off + 2]);
-        drawPixelCircle(ctx, dx, dy, 4, COLORS.ink, null);
+        drawLayerShape(ctx, dLayer, dx, dy, 3.5, COLORS.ink, null);
       }
     }
   }
 
-  // Selected part 32px outward rotation arc
+  // Selected part: 32px outward rotation arc + floating pitch/layer badge
   if (selectedPart && isSoloed) {
+    const li = LAYER_KEYS.indexOf(selectedPart.layerKey);
     const layer = genome[selectedPart.layerKey];
     const target = selectedPart.isEmitter ? layer.e : layer.p[selectedPart.index];
     if (target) {
-      const tx = px(selectedPart.isEmitter ? target[0] : target[1]);
-      const ty = px(selectedPart.isEmitter ? target[1] : target[2]);
+      const worldX = selectedPart.isEmitter ? target[0] : target[1];
+      const worldY = selectedPart.isEmitter ? target[1] : target[2];
+      const tx = px(worldX);
+      const ty = px(worldY);
       const deg = selectedPart.isEmitter ? target[2] : target[3];
       const rad = (deg * Math.PI) / 180;
       const r = Math.max(24, arcOffsetCanvas);
 
-      ctx.strokeStyle = accentColor;
-      ctx.lineWidth = 2;
-      ctx.setLineDash([4, 4]);
-      ctx.beginPath();
-      ctx.arc(tx, ty, r, rad - 0.9, rad + 0.9);
-      ctx.stroke();
-      ctx.setLineDash([]);
+      // Show rotation arc for emitters and ramps
+      const rotatable = selectedPart.isEmitter || target[0] === 0;
+      if (rotatable) {
+        ctx.strokeStyle = accentColor;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.arc(tx, ty, r, rad - 0.9, rad + 0.9);
+        ctx.stroke();
+        ctx.setLineDash([]);
 
-      const hx = Math.round(tx + Math.cos(rad) * r);
-      const hy = Math.round(ty + Math.sin(rad) * r);
-      ctx.fillStyle = accentColor;
-      ctx.fillRect(hx - 6, hy - 6, 12, 12);
-      ctx.fillStyle = COLORS.bg;
-      ctx.fillRect(hx - 2, hy - 2, 4, 4);
+        const hx = Math.round(tx + Math.cos(rad) * r);
+        const hy = Math.round(ty + Math.sin(rad) * r);
+        ctx.fillStyle = accentColor;
+        ctx.fillRect(hx - 6, hy - 6, 12, 12);
+        ctx.fillStyle = COLORS.bg;
+        ctx.fillRect(hx - 2, hy - 2, 4, 4);
+      } else {
+        // Highlight ring for non-rotatable bells/bumpers/teleporters
+        ctx.strokeStyle = accentColor;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([3, 3]);
+        drawLayerShape(ctx, li, tx, ty, px(target[4]) + 6, null, accentColor);
+        ctx.setLineDash([]);
+      }
+
+      // Floating musical label badge (--cw-bg ink on --cw-accent fill)
+      let label = LAYER_TAGS[li];
+      if (!selectedPart.isEmitter) {
+        const kind = target[0];
+        if (kind === 3 || kind === 1) {
+          if (li === 1) {
+            const pIdx = target[5] < 0 ? spatialPitchFromY(worldY) : Math.abs(Math.floor(target[5]));
+            label = `PERC ${DRUM_NAMES[pIdx % 4]}`;
+          } else {
+            const note = getNoteNameForY(worldY, genome.s || 0);
+            label = `${LAYER_TAGS[li]} ${note}`;
+          }
+        } else if (kind === 0) {
+          label = `${LAYER_TAGS[li]} RAMP`;
+        } else if (kind === 2) {
+          label = `${LAYER_TAGS[li]} PORTAL`;
+        }
+      } else {
+        label = `${LAYER_TAGS[li]} EMIT`;
+      }
+
+      if (!dragDeleting) {
+        const badgeBg = isIdle ? COLORS.ink : COLORS.accent;
+        drawBadge(ctx, tx, ty - (isDragging ? 28 : 24), label, badgeBg, COLORS.bg);
+      }
     }
+  }
+
+  // Active 4-bar chord badge in top-right of soloed chamber while playing
+  if (!isIdle && isSoloed && chordName && !dragDeleting) {
+    drawBadge(ctx, CANVAS_SIZE - 34, 14, chordName, COLORS.surface, COLORS.ink);
   }
 
   // Soloed live oscilloscope OR idle offspring 4px static rhythm barcode
@@ -379,7 +549,14 @@ export function renderVinylPlatter(canvas, state, spinAngle, encodeProgress, ton
   ctx.arc(0, 0, r * 0.48, 3.2, 5.2);
   ctx.stroke();
   // Label
-  drawPixelCircle(ctx, 0, 0, r * 0.28, state === 'complete' ? COLORS.active : (state === 'idle' ? COLORS.ink : COLORS.accent), null);
+  drawPixelCircle(
+    ctx,
+    0,
+    0,
+    r * 0.28,
+    state === 'complete' ? COLORS.active : (state === 'idle' ? COLORS.ink : COLORS.accent),
+    null
+  );
   drawPixelCircle(ctx, 0, 0, 3, COLORS.bg, null);
   ctx.restore();
 
@@ -396,7 +573,6 @@ export function renderVinylPlatter(canvas, state, spinAngle, encodeProgress, ton
   // Tonearm with 120ms spring drop animation
   const pivotX = w - 9;
   const pivotY = 10;
-  // Resting angle off-platter vs dropped onto groove
   const restAng = Math.PI * 0.52;
   const dropAng = Math.PI * 0.72;
   const armAng = restAng + (dropAng - restAng) * tonearmSpring;
