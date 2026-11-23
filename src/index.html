@@ -157,6 +157,12 @@
       white-space: nowrap;
     }
 
+    .cw-btn.mini {
+      min-height: 24px;
+      padding: 2px 6px;
+      font-size: 10px;
+    }
+
     .cw-btn:active {
       transform: translateY(1px);
     }
@@ -282,6 +288,7 @@
       gap: 4px;
       margin-bottom: 4px;
       flex-shrink: 0;
+      flex-wrap: wrap;
     }
 
     .niche-label {
@@ -333,7 +340,7 @@
       touch-action: none;
     }
 
-    /* Parent Layer LED Controls */
+    /* Parent Layer LED Controls & Part Spawner */
     .parent-controls {
       display: flex;
       align-items: center;
@@ -348,6 +355,7 @@
       display: flex;
       align-items: center;
       gap: 4px;
+      flex-wrap: wrap;
     }
 
     .led-switch {
@@ -355,9 +363,9 @@
       background: var(--cw-bg);
       color: var(--cw-ink);
       border: 1px solid var(--cw-ink);
-      padding: 5px 8px;
-      min-height: 32px;
-      min-width: 56px;
+      padding: 4px 7px;
+      min-height: 30px;
+      min-width: 54px;
       font-family: inherit;
       font-size: 10px;
       font-weight: 700;
@@ -367,6 +375,16 @@
       align-items: center;
       justify-content: center;
       gap: 5px;
+      position: relative;
+    }
+
+    .led-switch.edit-focus {
+      outline: 1px solid var(--cw-ink);
+      outline-offset: 1px;
+    }
+
+    body:not([data-state="idle"]) .led-switch.edit-focus {
+      outline-color: var(--cw-accent);
     }
 
     .led-pip {
@@ -375,6 +393,14 @@
       border: 1px solid var(--cw-ink);
       background: var(--cw-bg);
       display: inline-block;
+    }
+
+    .led-pip.shape-perc {
+      transform: rotate(45deg);
+    }
+
+    .led-pip.shape-mel {
+      border-radius: 50%;
     }
 
     /* Active LED: lit --cw-accent with --cw-bg glyph */
@@ -513,8 +539,11 @@
           <div class="chamber-head">
             <span class="niche-label">PARENT</span>
             <div class="led-group">
-              <button id="scale-btn" class="cw-btn" style="min-height:24px;padding:2px 6px;" type="button">PENT</button>
-              <button id="mutate-btn" class="cw-btn" style="min-height:24px;padding:2px 8px;" type="button">MUTATE</button>
+              <button id="add-bell-btn" class="cw-btn mini" type="button">+BELL</button>
+              <button id="add-ramp-btn" class="cw-btn mini" type="button">+RAMP</button>
+              <button id="add-bump-btn" class="cw-btn mini" type="button">+BUMP</button>
+              <button id="scale-btn" class="cw-btn mini" type="button">PENT</button>
+              <button id="mutate-btn" class="cw-btn mini" type="button">MUTATE</button>
             </div>
           </div>
           <div class="canvas-cavity">
@@ -522,9 +551,9 @@
           </div>
           <div class="parent-controls">
             <div class="led-group">
-              <button id="led-bass" class="led-switch" data-layer="bass" data-mode="active" type="button"><span class="led-pip"></span>BASS</button>
-              <button id="led-perc" class="led-switch" data-layer="perc" data-mode="active" type="button"><span class="led-pip"></span>PERC</button>
-              <button id="led-mel" class="led-switch" data-layer="mel" data-mode="active" type="button"><span class="led-pip"></span>MEL</button>
+              <button id="led-bass" class="led-switch" data-layer="bass" data-mode="active" type="button"><span class="led-pip shape-bass"></span>BASS</button>
+              <button id="led-perc" class="led-switch" data-layer="perc" data-mode="active" type="button"><span class="led-pip shape-perc"></span>PERC</button>
+              <button id="led-mel" class="led-switch edit-focus" data-layer="mel" data-mode="active" type="button"><span class="led-pip shape-mel"></span>MEL</button>
             </div>
             <span id="genome-bytes" class="niche-label">000B</span>
           </div>
@@ -575,7 +604,7 @@
     <footer id="drawer">
       <div id="drawer-bar">
         <div id="commissions-summary" class="niche-label">COMMISSIONS 0/4</div>
-        <button id="drawer-toggle" class="cw-btn" style="min-height:26px;padding:2px 8px;" type="button">DRAWER ▲</button>
+        <button id="drawer-toggle" class="cw-btn mini" type="button">DRAWER ▲</button>
       </div>
       <div id="drawer-body">
         <div id="commissions-list">
