@@ -1,4 +1,7 @@
-// ChimeWorks (32-Bit Edition) — WASM Physics, Speculative MAP-Elites & Off-Thread MP3 Worker
+// ChimeWorks (32-Bit Edition) — WASM Physics, Trajectory-Aware MAP-Elites & Off-Thread MP3 Worker
+// Upgrades: Live trajectory streaming on every edit, trajectory-aware mutation (snaps bells/bumpers
+// directly onto traced droplet paths with spatial pitch tuning), live-config preservation across
+// background rollouts, and off-thread 128 kbps MP3 encoding via lame.min.js.
 /* global importScripts, lamejs */
 
 const LAYER_KEYS = ['b', 'p', 'm'];
@@ -11,9 +14,24 @@ const KF_LEN = 64 * 49;
 const BARCODE_LEN = 16;
 const METRICS_LEN = 8;
 
+// Trajectory layout matching wasm/physics.rs (3 layers * (1 count + 90 * 2 coords))
+const TRAJ_MAX_PTS = 90;
+const TRAJ_LAYER_STRIDE = 1 + TRAJ_MAX_PTS * 2; // 181
+const TRAJ_TOTAL_LEN = 3 * TRAJ_LAYER_STRIDE;   // 543
+
+// Musical emitter tick intervals (clean rhythmic ratios at 60 Hz)
+const LAYER_RATES = [
+  [36, 48, 60, 72, 96], // BASS: slow harmonic anchors
+  [18, 24, 30, 36, 48], // PERC: steady pulse & syncopation
+  [16, 20, 24, 32, 40], // MEL: flowing arpeggios & chimes
+];
+
 let wasm = null;
 let lameLoaded = false;
 let rngState = 0x1337c0de;
+
+// Keep a copy of the currently soloed live chamber so background rollouts never hijack live playback
+let liveConfig = null;
 
 function rand() {
   rngState ^= rngState << 13;
@@ -53,80 +71,145 @@ function writeGenomeToWasm(genome, layerMuted = [false, false, false]) {
     emitters[eb + 3] = e[1];
     emitters[eb + 4] = (e[2] * Math.PI) / 180;
     emitters[eb + 5] = e[3];
-    emitters[eb + 6] = Math.max(8, e[4]);
+    emitters[eb + 6] = Math.max(10, e[4]);
     emitters[eb + 7] = (layerMuted[li] || e[5] === 1) ? 1.0 : 0.0;
 
     for (let pi = 0; pi < layer.p.length && partCursor < 32; pi++) {
       const p = layer.p[pi];
       const pb = partCursor * PART_STRIDE;
       parts[pb] = 1.0;
-      parts[pb + 1] = p[0]; // kind
+      parts[pb + 1] = p[0]; // kind (0=ramp, 1=bumper, 2=teleporter, 3=bell)
       parts[pb + 2] = li;   // layer
       parts[pb + 3] = p[1]; // x
       parts[pb + 4] = p[2]; // y
       parts[pb + 5] = (p[3] * Math.PI) / 180; // angle
       parts[pb + 6] = p[4]; // size
-      parts[pb + 7] = p[5]; // param
+      parts[pb + 7] = p[5]; // param (< 0 => spatial pitch from Y height)
       parts[pb + 8] = (layerMuted[li] || p[6] === 1) ? 1.0 : 0.0;
       partCursor++;
     }
   }
 }
 
-function mutateGenome(parent, locks, intensity = 1) {
+function restoreLiveConfig() {
+  if (liveConfig && wasm) {
+    writeGenomeToWasm(liveConfig.genome, liveConfig.layerMuted);
+  }
+}
+
+function traceTrajectoriesCopy(ticks = 180) {
+  wasm.trace_trajectories(ticks);
+  const mem = wasm.memory.buffer;
+  return new Float32Array(new Float32Array(mem, wasm.get_trajectory_ptr(), TRAJ_TOTAL_LEN));
+}
+
+function sampleTrajectoryPoint(traj, layerIdx, minFrac, maxFrac) {
+  const base = layerIdx * TRAJ_LAYER_STRIDE;
+  const count = Math.min(TRAJ_MAX_PTS, Math.floor(traj[base]));
+  if (count < 4) return null;
+  const lo = clampInt(count * minFrac, 2, count - 1);
+  const hi = clampInt(count * maxFrac, lo, count - 1);
+  const pick = randInt(lo, hi);
+  const x = traj[base + 1 + pick * 2];
+  const y = traj[base + 1 + pick * 2 + 1];
+  return {
+    x: clampInt(x, 18, 142),
+    y: clampInt(y, 26, 142),
+  };
+}
+
+/**
+ * Trajectory-aware musical mutation:
+ * 1. Adjusts musical rhythm subdivisions and emitter aim on unlocked layers.
+ * 2. Traces the resulting physics paths in WASM.
+ * 3. Snaps bells/bumpers directly onto valid trajectory points so every mutation plays real notes.
+ */
+function mutateGenomeTrajectoryAware(parent, locks, intensity = 1) {
   const g = cloneGenome(parent);
-  if (rand() < 0.12) g.s = g.s === 0 ? 1 : 0;
+  if (rand() < 0.15) g.s = g.s === 0 ? 1 : 0;
 
   const lockArr = [!!locks.bass, !!locks.perc, !!locks.mel];
 
+  // Pass 1: Mutate emitters & ramp angles on unlocked layers
   for (let li = 0; li < 3; li++) {
     if (lockArr[li]) continue;
     const lk = LAYER_KEYS[li];
     const layer = g[lk];
 
-    // Mutate emitter angle/rate/position
     if (rand() < 0.65) {
-      layer.e[0] = clampInt(layer.e[0] + randInt(-16, 16) * intensity, 20, 140);
-      layer.e[2] = (layer.e[2] + randInt(-28, 28) * intensity + 360) % 360;
+      layer.e[2] = clampInt(layer.e[2] + randInt(-20, 20) * intensity, 15, 165);
     }
-    if (rand() < 0.55) {
-      const rates = li === 0 ? [30, 40, 48, 60, 72] : li === 1 ? [15, 20, 24, 30, 36] : [16, 20, 24, 32, 40];
+    if (rand() < 0.45) {
+      layer.e[3] = clampInt(layer.e[3] + randInt(-10, 10) * intensity, 40, 105);
+    }
+    if (rand() < 0.6) {
+      const rates = LAYER_RATES[li];
       layer.e[4] = rates[randInt(0, rates.length - 1)];
     }
 
-    // Mutate existing parts
     for (let pi = 0; pi < layer.p.length; pi++) {
       const p = layer.p[pi];
-      if (rand() < 0.6) {
-        p[1] = clampInt(p[1] + randInt(-18, 18) * intensity, 18, 142);
-        p[2] = clampInt(p[2] + randInt(-16, 16) * intensity, 34, 142);
+      if (p[0] === 0 && rand() < 0.65) {
+        p[3] = (p[3] + randInt(-24, 24) + 360) % 360;
       }
-      if (p[0] === 0 && rand() < 0.7) {
-        p[3] = (p[3] + randInt(-30, 30) + 360) % 360;
-      }
-      if (p[0] === 3 && rand() < 0.65) {
-        p[5] = randInt(0, 14);
-      }
-    }
-
-    // Occasionally swap a part kind while keeping <400 byte genome budget
-    if (rand() < 0.25 && layer.p.length > 0) {
-      const idx = randInt(0, layer.p.length - 1);
-      const kind = li === 1 ? (rand() < 0.6 ? 1 : 3) : (rand() < 0.45 ? 0 : 3);
-      layer.p[idx][0] = kind;
-      layer.p[idx][4] = kind === 0 ? randInt(16, 24) : randInt(8, 11);
-      if (kind === 3) layer.p[idx][5] = randInt(0, 14);
     }
   }
 
-  // Enforce strict <400-byte JSON genome limit
+  // Pass 2: Trace the live droplet arcs for this candidate, then snap bells/bumpers onto the path
+  writeGenomeToWasm(g, [false, false, false]);
+  const traj = traceTrajectoriesCopy(180);
+
+  for (let li = 0; li < 3; li++) {
+    if (lockArr[li]) continue;
+    const lk = LAYER_KEYS[li];
+    const layer = g[lk];
+    const nParts = layer.p.length;
+
+    for (let pi = 0; pi < nParts; pi++) {
+      const p = layer.p[pi];
+      const kind = p[0];
+      if (kind === 2) continue; // Keep teleporter pairs stable unless nudged gently
+
+      if (rand() < 0.7) {
+        // Partition trajectory into sequential windows so parts form a melodic cascade
+        const winLo = 0.12 + (pi / Math.max(1, nParts)) * 0.68;
+        const winHi = Math.min(0.92, winLo + 0.22);
+        const pt = sampleTrajectoryPoint(traj, li, winLo, winHi);
+        if (pt) {
+          p[1] = clampInt(pt.x + randInt(-4, 4), 18, 142);
+          p[2] = clampInt(pt.y + randInt(-3, 3), 28, 142);
+        }
+      }
+
+      // Use spatial Y-height pitch (-1) so visual height always matches musical pitch
+      if (kind === 3 || kind === 1) {
+        p[5] = -1;
+      }
+    }
+
+    // Occasionally evolve a part type (e.g. ramp <-> bell/bumper) while staying musical
+    if (rand() < 0.22 && nParts > 0) {
+      const idx = randInt(0, nParts - 1);
+      if (layer.p[idx][0] !== 2) {
+        const nextKind = li === 1 ? (rand() < 0.7 ? 1 : 3) : (rand() < 0.28 ? 0 : 3);
+        layer.p[idx][0] = nextKind;
+        layer.p[idx][4] = nextKind === 0 ? randInt(16, 22) : randInt(8, 10);
+        layer.p[idx][5] = nextKind === 0 ? 0 : -1;
+      }
+    }
+  }
+
+  // Enforce strict <400-byte JSON genome budget
   while (JSON.stringify(g).length >= 400) {
+    let trimmed = false;
     for (const lk of LAYER_KEYS) {
       if (g[lk].p.length > 2) {
         g[lk].p.pop();
+        trimmed = true;
         break;
       }
     }
+    if (!trimmed) break;
   }
   return g;
 }
@@ -134,16 +217,16 @@ function mutateGenome(parent, locks, intensity = 1) {
 function scoreNiche(niche, m) {
   // m = [total, bass, perc, mel, unique_pitches, avg_ioi, ioi_var, bumper_hits]
   const [total, bass, perc, mel, uniq, avgIoi, ioiVar, bumpers] = m;
-  if (total < 1) return -1e6;
+  if (total < 2) return -1e6;
   switch (niche) {
-    case 0: // Sparse Ambient: low-moderate density, wide IOI, melodic bells
-      return (total >= 3 && total <= 14 ? 40 : -Math.abs(total - 8) * 3) + avgIoi * 0.9 + mel * 2.2 - perc * 0.8;
-    case 1: // Fast Polyrhythmic: high density, multi-layer balance, rhythmic variance
-      return total * 1.4 + Math.min(bass, perc, mel) * 6.0 + Math.sqrt(ioiVar) * 1.5 - avgIoi * 0.4;
-    case 2: // Percussive: dominant perc + bumper impacts
-      return perc * 4.5 + bumpers * 5.0 + total * 0.5;
-    case 3: // Melodic: highest melodic note count & pitch diversity
-      return mel * 3.8 + uniq * 9.0 + bass * 1.2;
+    case 0: // Sparse Ambient: spacious IOI, gentle density, melodic bells
+      return (total >= 4 && total <= 14 ? 45 : -Math.abs(total - 9) * 3) + avgIoi * 1.1 + mel * 2.4 - perc * 0.6;
+    case 1: // Fast Polyrhythmic: balanced multi-layer density & groove variance
+      return total * 1.3 + Math.min(bass, perc, mel) * 7.5 + Math.sqrt(ioiVar) * 1.6 - avgIoi * 0.35;
+    case 2: // Percussive: strong perc + bumper hits
+      return perc * 4.5 + bumpers * 5.2 + bass * 1.5;
+    case 3: // Melodic: richest melodic note count & pitch diversity
+      return mel * 4.0 + uniq * 9.5 + bass * 1.5;
     default:
       return total;
   }
@@ -243,7 +326,19 @@ self.onmessage = async (e) => {
     if (!wasm) return;
 
     if (msg.type === 'loadLive') {
-      writeGenomeToWasm(msg.genome, msg.layerMuted);
+      liveConfig = {
+        genome: cloneGenome(msg.genome),
+        layerMuted: msg.layerMuted || [false, false, false],
+      };
+      writeGenomeToWasm(liveConfig.genome, liveConfig.layerMuted);
+      const trajectories = traceTrajectoriesCopy(180);
+      self.postMessage({ type: 'trajectories', trajectories }, [trajectories.buffer]);
+      return;
+    }
+
+    if (msg.type === 'traceLive') {
+      const trajectories = traceTrajectoriesCopy(180);
+      self.postMessage({ type: 'trajectories', trajectories }, [trajectories.buffer]);
       return;
     }
 
@@ -258,8 +353,15 @@ self.onmessage = async (e) => {
 
     if (msg.type === 'rolloutChamber') {
       const res = runRolloutCopy(msg.genome, msg.layerMuted, 240);
+      restoreLiveConfig();
       self.postMessage(
-        { type: 'chamberRollout', slot: msg.slot, keyframes: res.keyframes, barcode: res.barcode, eventCount: res.eventCount },
+        {
+          type: 'chamberRollout',
+          slot: msg.slot,
+          keyframes: res.keyframes,
+          barcode: res.barcode,
+          eventCount: res.eventCount,
+        },
         [res.keyframes.buffer, res.barcode.buffer]
       );
       return;
@@ -268,10 +370,10 @@ self.onmessage = async (e) => {
     if (msg.type === 'evolveOffspring') {
       rngState = (msg.seed >>> 0) || 0x1337c0de;
       const best = [null, null, null, null];
-      const candidates = 24;
+      const candidates = 20;
 
       for (let c = 0; c < candidates; c++) {
-        const cand = mutateGenome(msg.parentGenome, msg.locks, c < 12 ? 1 : 1.5);
+        const cand = mutateGenomeTrajectoryAware(msg.parentGenome, msg.locks, c < 10 ? 1 : 1.4);
         const res = runRolloutCopy(cand, [false, false, false], 240);
         for (let n = 0; n < 4; n++) {
           const sc = scoreNiche(n, res.metrics);
@@ -288,7 +390,8 @@ self.onmessage = async (e) => {
         }
       }
 
-      // Transfer unique buffers cleanly
+      restoreLiveConfig();
+
       const transfer = [];
       const seen = new Set();
       const offspring = best.map((item) => {
@@ -312,6 +415,7 @@ self.onmessage = async (e) => {
       const evCount = wasm.rollout(ticks, 4);
       const mem = wasm.memory.buffer;
       const events = new Float32Array(new Float32Array(mem, wasm.get_events_ptr(), evCount * EVENT_STRIDE));
+      restoreLiveConfig();
       self.postMessage({ type: 'eventsReady', events, ticks }, [events.buffer]);
     }
   } catch (err) {
