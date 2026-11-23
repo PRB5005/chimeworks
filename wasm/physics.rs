@@ -1,4 +1,6 @@
-// ChimeWorks (32-Bit Edition) — Zero-Dependency Fixed-Timestep 2D Physics Engine
+// ChimeWorks (32-Bit Edition) — Musical Fixed-Timestep 2D Physics Engine
+// Upgrades: 133ms per-part debounce, Y-mapped spatial pitch tuning, non-destructive
+// trajectory path tracer (for live aiming previews & trajectory-aware evolution).
 // Compile: rustc --edition=2021 --target wasm32-unknown-unknown --crate-type=cdylib -O wasm/physics.rs -o src/physics.wasm
 
 use core::ptr::addr_of_mut;
@@ -10,12 +12,14 @@ const GRAVITY: f32 = 240.0;
 const DROP_RADIUS: f32 = 3.0;
 const DROP_TTL: f32 = 300.0;
 const MAX_SPEED: f32 = 210.0;
+const PART_COOLDOWN_TICKS: f32 = 8.0; // ~133ms at 60 Hz to prevent buzzing/machine-gunning
 
 const MAX_EMITTERS: usize = 6;
 const EMITTER_STRIDE: usize = 8; // [active, layer, x, y, angle, speed, rate, muted]
 
 const MAX_PARTS: usize = 32;
 const PART_STRIDE: usize = 9; // [active, kind, layer, x, y, angle, size, param, muted]
+                              // param < 0.0 => spatial pitch derived from part Y height
 
 const MAX_DROPLETS: usize = 48;
 const DROPLET_STRIDE: usize = 8; // [active, layer, x, y, vx, vy, ttl, tp_cd]
@@ -30,13 +34,21 @@ const KF_STRIDE: usize = 1 + KF_MAX_DROPS * 3; // [count, l0, x0, y0, ...]
 const METRICS_LEN: usize = 8; // [total, bass, perc, mel, unique_pitches, avg_ioi, ioi_var, bumper_hits]
 const BARCODE_LEN: usize = 16;
 
+// Trajectory preview buffer: 3 layers, each [count, x0, y0, x1, y1, ... up to 90 pts]
+const TRAJ_LAYERS: usize = 3;
+const TRAJ_MAX_PTS: usize = 90;
+const TRAJ_LAYER_STRIDE: usize = 1 + TRAJ_MAX_PTS * 2; // 181 f32s per layer
+const TRAJ_TOTAL_LEN: usize = TRAJ_LAYERS * TRAJ_LAYER_STRIDE; // 543 f32s
+
 static mut EMITTERS: [f32; MAX_EMITTERS * EMITTER_STRIDE] = [0.0; MAX_EMITTERS * EMITTER_STRIDE];
 static mut PARTS: [f32; MAX_PARTS * PART_STRIDE] = [0.0; MAX_PARTS * PART_STRIDE];
+static mut PART_COOLDOWN: [f32; MAX_PARTS] = [0.0; MAX_PARTS];
 static mut DROPLETS: [f32; MAX_DROPLETS * DROPLET_STRIDE] = [0.0; MAX_DROPLETS * DROPLET_STRIDE];
 static mut EVENTS: [f32; MAX_EVENTS * EVENT_STRIDE] = [0.0; MAX_EVENTS * EVENT_STRIDE];
 static mut KEYFRAMES: [f32; MAX_KEYFRAMES * KF_STRIDE] = [0.0; MAX_KEYFRAMES * KF_STRIDE];
 static mut METRICS: [f32; METRICS_LEN] = [0.0; METRICS_LEN];
 static mut BARCODE: [f32; BARCODE_LEN] = [0.0; BARCODE_LEN];
+static mut TRAJECTORY: [f32; TRAJ_TOTAL_LEN] = [0.0; TRAJ_TOTAL_LEN];
 
 static mut TICK: u32 = 0;
 static mut EVENT_COUNT: u32 = 0;
@@ -58,6 +70,14 @@ fn sqrt_f32(x: f32) -> f32 {
         return 0.0;
     }
     x.sqrt()
+}
+
+/// Maps vertical Y coordinate (16..144) to scale degree (14 at top -> 0 at bottom).
+#[inline]
+fn spatial_pitch_from_y(y: f32) -> u32 {
+    let norm = 1.0 - clamp((y - 16.0) / 128.0, 0.0, 1.0);
+    let idx = (norm * 14.0 + 0.5) as i32;
+    clamp(idx as f32, 0.0, 14.0) as u32
 }
 
 #[no_mangle]
@@ -96,10 +116,19 @@ pub extern "C" fn get_barcode_ptr() -> *mut f32 {
 }
 
 #[no_mangle]
+pub extern "C" fn get_trajectory_ptr() -> *mut f32 {
+    unsafe { addr_of_mut!(TRAJECTORY) as *mut f32 }
+}
+
+#[no_mangle]
 pub extern "C" fn reset_world() {
     unsafe {
         let drops = &mut *addr_of_mut!(DROPLETS);
         for v in drops.iter_mut() {
+            *v = 0.0;
+        }
+        let cd = &mut *addr_of_mut!(PART_COOLDOWN);
+        for v in cd.iter_mut() {
             *v = 0.0;
         }
         let evs = &mut *addr_of_mut!(EVENTS);
@@ -151,7 +180,7 @@ unsafe fn push_event(tick: u32, layer: u32, kind: u32, part_idx: u32, pitch: u32
     evs[base + 3] = part_idx as f32;
     evs[base + 4] = pitch as f32;
     evs[base + 5] = clamp(x / WORLD_W, 0.0, 1.0);
-    evs[base + 6] = clamp(vel / 160.0, 0.15, 1.0);
+    evs[base + 6] = clamp(vel / 160.0, 0.2, 1.0);
     EVENT_COUNT += 1;
 }
 
@@ -199,34 +228,16 @@ unsafe fn find_teleporter_partner(self_idx: usize, layer: i32, param: i32) -> Op
     fallback
 }
 
-unsafe fn step_one_tick() {
-    let cur_tick = TICK;
-    let emitters = &*addr_of_mut!(EMITTERS);
+/// Core droplet integration & collision step shared by live simulation and trajectory tracing.
+unsafe fn integrate_droplets(cur_tick: u32, emit_events: bool) {
     let parts = &*addr_of_mut!(PARTS);
-
-    // 1. Emit droplets deterministically
-    for i in 0..MAX_EMITTERS {
-        let eb = i * EMITTER_STRIDE;
-        if emitters[eb] < 0.5 || emitters[eb + 7] >= 0.5 {
-            continue;
-        }
-        let rate = emitters[eb + 6] as u32;
-        if rate == 0 {
-            continue;
-        }
-        if cur_tick % rate == 0 {
-            let layer = emitters[eb + 1];
-            let x = emitters[eb + 2];
-            let y = emitters[eb + 3];
-            let ang = emitters[eb + 4];
-            let spd = emitters[eb + 5];
-            let vx = ang.cos() * spd;
-            let vy = ang.sin() * spd;
-            spawn_droplet(layer, x, y, vx, vy);
+    let cooldowns = &mut *addr_of_mut!(PART_COOLDOWN);
+    for cd in cooldowns.iter_mut() {
+        if *cd > 0.0 {
+            *cd -= 1.0;
         }
     }
 
-    // 2. Integrate droplets & resolve same-layer collisions
     let drops = &mut *addr_of_mut!(DROPLETS);
     for d in 0..MAX_DROPLETS {
         let db = d * DROPLET_STRIDE;
@@ -238,7 +249,7 @@ unsafe fn step_one_tick() {
         let mut y = drops[db + 3];
         let mut vx = drops[db + 4];
         let mut vy = drops[db + 5];
-        let mut ttl = drops[db + 6] - 1.0;
+        let ttl = drops[db + 6] - 1.0;
         let mut tp_cd = if drops[db + 7] > 0.0 { drops[db + 7] - 1.0 } else { 0.0 };
 
         vy += GRAVITY * DT;
@@ -252,7 +263,7 @@ unsafe fn step_one_tick() {
         x += vx * DT;
         y += vy * DT;
 
-        // Chamber side wall bounce (top/sides bounce softly, bottom exits)
+        // Chamber wall bounces (bottom exits cleanly)
         if x < DROP_RADIUS {
             x = DROP_RADIUS;
             vx = vx.abs() * 0.78;
@@ -269,7 +280,7 @@ unsafe fn step_one_tick() {
             continue;
         }
 
-        // Collide only with parts on the exact same non-colliding layer
+        // Collide only with parts on the same non-colliding layer
         for p in 0..MAX_PARTS {
             let pb = p * PART_STRIDE;
             if parts[pb] < 0.5 {
@@ -283,7 +294,7 @@ unsafe fn step_one_tick() {
             let py = parts[pb + 4];
             let pang = parts[pb + 5];
             let psize = parts[pb + 6];
-            let pparam = parts[pb + 7] as i32;
+            let raw_param = parts[pb + 7];
             let pmuted = parts[pb + 8] >= 0.5;
 
             match kind {
@@ -294,7 +305,6 @@ unsafe fn step_one_tick() {
                     let dx = x - px;
                     let dy = y - py;
                     let local_x = dx * cos_a + dy * sin_a;
-                    let local_y = -dx * sin_a + dy * cos_a;
                     let clamped_x = clamp(local_x, -psize, psize);
                     let cx = px + clamped_x * cos_a;
                     let cy = py + clamped_x * sin_a;
@@ -313,11 +323,10 @@ unsafe fn step_one_tick() {
                             vy -= (1.0 + restitution) * vn * ny;
                             x = cx + nx * (hit_r + 0.15);
                             y = cy + ny * (hit_r + 0.15);
-                            let _ = local_y;
                         }
                     }
                 }
-                // 1: Bumper (radial boost + percussive trigger)
+                // 1: Bumper (radial boost + percussive trigger with 133ms debounce)
                 1 => {
                     let rx = x - px;
                     let ry = y - py;
@@ -332,14 +341,20 @@ unsafe fn step_one_tick() {
                             let impact = -vn;
                             vx -= 2.0 * vn * nx;
                             vy -= 2.0 * vn * ny;
-                            let new_spd = clamp(sqrt_f32(vx * vx + vy * vy) * 1.12, 75.0, MAX_SPEED);
                             let cur_spd = sqrt_f32(vx * vx + vy * vy).max(1e-4);
+                            let new_spd = clamp(cur_spd * 1.12, 75.0, MAX_SPEED);
                             vx = vx / cur_spd * new_spd;
                             vy = vy / cur_spd * new_spd;
                             x = px + nx * (hit_r + 0.25);
                             y = py + ny * (hit_r + 0.25);
-                            if !pmuted {
-                                push_event(cur_tick, d_layer as u32, 1, p as u32, pparam.max(0) as u32, x, impact);
+                            if emit_events && !pmuted && cooldowns[p] <= 0.0 {
+                                cooldowns[p] = PART_COOLDOWN_TICKS;
+                                let pitch = if raw_param < 0.0 {
+                                    spatial_pitch_from_y(py)
+                                } else {
+                                    raw_param as u32
+                                };
+                                push_event(cur_tick, d_layer as u32, 1, p as u32, pitch, x, impact);
                             }
                         }
                     }
@@ -351,18 +366,19 @@ unsafe fn step_one_tick() {
                         let ry = y - py;
                         let hit_r = DROP_RADIUS + psize;
                         if rx * rx + ry * ry < hit_r * hit_r {
-                            if let Some((tx, ty)) = find_teleporter_partner(p, d_layer, pparam) {
+                            if let Some((tx, ty)) = find_teleporter_partner(p, d_layer, raw_param as i32) {
                                 x = tx;
                                 y = ty;
                                 tp_cd = 16.0;
-                                if !pmuted {
+                                if emit_events && !pmuted && cooldowns[p] <= 0.0 {
+                                    cooldowns[p] = PART_COOLDOWN_TICKS;
                                     push_event(cur_tick, d_layer as u32, 2, p as u32, 0, tx, 60.0);
                                 }
                             }
                         }
                     }
                 }
-                // 3: Bell (musical note trigger + chime bounce)
+                // 3: Bell (musical note trigger with 133ms debounce & clean bounce)
                 3 => {
                     let rx = x - px;
                     let ry = y - py;
@@ -375,13 +391,23 @@ unsafe fn step_one_tick() {
                         let vn = vx * nx + vy * ny;
                         if vn < 0.0 {
                             let impact = -vn;
-                            let restitution = 0.82;
+                            let restitution = 0.84;
                             vx -= (1.0 + restitution) * vn * nx;
                             vy -= (1.0 + restitution) * vn * ny;
+                            // Prevent slow droplets from stalling & buzzing on top of a bell
+                            if ny < -0.5 && vy > -32.0 {
+                                vy = -38.0;
+                            }
                             x = px + nx * (hit_r + 0.2);
                             y = py + ny * (hit_r + 0.2);
-                            if !pmuted {
-                                push_event(cur_tick, d_layer as u32, 3, p as u32, pparam.max(0) as u32, x, impact);
+                            if emit_events && !pmuted && cooldowns[p] <= 0.0 {
+                                cooldowns[p] = PART_COOLDOWN_TICKS;
+                                let pitch = if raw_param < 0.0 {
+                                    spatial_pitch_from_y(py)
+                                } else {
+                                    raw_param as u32
+                                };
+                                push_event(cur_tick, d_layer as u32, 3, p as u32, pitch, x, impact);
                             }
                         }
                     }
@@ -397,7 +423,34 @@ unsafe fn step_one_tick() {
         drops[db + 6] = ttl;
         drops[db + 7] = tp_cd;
     }
+}
 
+unsafe fn step_one_tick() {
+    let cur_tick = TICK;
+    let emitters = &*addr_of_mut!(EMITTERS);
+
+    // 1. Emit droplets deterministically
+    for i in 0..MAX_EMITTERS {
+        let eb = i * EMITTER_STRIDE;
+        if emitters[eb] < 0.5 || emitters[eb + 7] >= 0.5 {
+            continue;
+        }
+        let rate = emitters[eb + 6] as u32;
+        if rate == 0 {
+            continue;
+        }
+        if cur_tick % rate == 0 {
+            let layer = emitters[eb + 1];
+            let x = emitters[eb + 2];
+            let y = emitters[eb + 3];
+            let ang = emitters[eb + 4];
+            let spd = emitters[eb + 5];
+            spawn_droplet(layer, x, y, ang.cos() * spd, ang.sin() * spd);
+        }
+    }
+
+    // 2. Integrate droplets & resolve collisions
+    integrate_droplets(cur_tick, true);
     TICK = cur_tick + 1;
 }
 
@@ -409,6 +462,88 @@ pub extern "C" fn step(n_ticks: u32) -> u32 {
             step_one_tick();
         }
         EVENT_COUNT
+    }
+}
+
+/// Non-destructively traces one single-shot droplet flight path per layer (up to 180 ticks)
+/// into TRAJECTORY so the UI can draw live aiming arcs and evolution can snap bells onto paths.
+#[no_mangle]
+pub extern "C" fn trace_trajectories(total_ticks: u32) -> u32 {
+    unsafe {
+        // Snapshot live state so live playback is never disturbed
+        let saved_drops = *addr_of_mut!(DROPLETS);
+        let saved_cd = *addr_of_mut!(PART_COOLDOWN);
+        let saved_tick = TICK;
+        let saved_ev_count = EVENT_COUNT;
+
+        // Clear workspace
+        let drops = &mut *addr_of_mut!(DROPLETS);
+        for v in drops.iter_mut() {
+            *v = 0.0;
+        }
+        let cd = &mut *addr_of_mut!(PART_COOLDOWN);
+        for v in cd.iter_mut() {
+            *v = 0.0;
+        }
+        let traj = &mut *addr_of_mut!(TRAJECTORY);
+        for v in traj.iter_mut() {
+            *v = 0.0;
+        }
+
+        // Spawn 1 probe droplet per active emitter (first emitter per layer 0..2)
+        let emitters = &*addr_of_mut!(EMITTERS);
+        let mut layer_spawned = [false; TRAJ_LAYERS];
+        for i in 0..MAX_EMITTERS {
+            let eb = i * EMITTER_STRIDE;
+            if emitters[eb] < 0.5 {
+                continue;
+            }
+            let li = emitters[eb + 1] as usize;
+            if li < TRAJ_LAYERS && !layer_spawned[li] {
+                layer_spawned[li] = true;
+                let x = emitters[eb + 2];
+                let y = emitters[eb + 3];
+                let ang = emitters[eb + 4];
+                let spd = emitters[eb + 5];
+                spawn_droplet(li as f32, x, y, ang.cos() * spd, ang.sin() * spd);
+            }
+        }
+
+        let ticks = total_ticks.min((TRAJ_MAX_PTS * 2) as u32);
+        let mut counts = [0usize; TRAJ_LAYERS];
+        let mut total_pts = 0u32;
+
+        for t in 0..ticks {
+            if t % 2 == 0 {
+                let d_ref = &*addr_of_mut!(DROPLETS);
+                for d in 0..TRAJ_LAYERS {
+                    let db = d * DROPLET_STRIDE;
+                    if d_ref[db] >= 0.5 {
+                        let li = d_ref[db + 1] as usize;
+                        if li < TRAJ_LAYERS && counts[li] < TRAJ_MAX_PTS {
+                            let idx = li * TRAJ_LAYER_STRIDE + 1 + counts[li] * 2;
+                            traj[idx] = d_ref[db + 2];
+                            traj[idx + 1] = d_ref[db + 3];
+                            counts[li] += 1;
+                            total_pts += 1;
+                        }
+                    }
+                }
+            }
+            integrate_droplets(t, false);
+        }
+
+        for li in 0..TRAJ_LAYERS {
+            traj[li * TRAJ_LAYER_STRIDE] = counts[li] as f32;
+        }
+
+        // Restore live state
+        *addr_of_mut!(DROPLETS) = saved_drops;
+        *addr_of_mut!(PART_COOLDOWN) = saved_cd;
+        TICK = saved_tick;
+        EVENT_COUNT = saved_ev_count;
+
+        total_pts
     }
 }
 
