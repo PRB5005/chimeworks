@@ -1,4 +1,4 @@
-// ChimeWorks (32-Bit Edition) — Master Controller, State Machine & Genome Manager
+// ChimeWorks (32-Bit Edition) — Master Controller, State Machine & Musical Genome Editor
 
 import { AudioEngine } from './audio.js';
 import {
@@ -10,38 +10,43 @@ import {
   clientToWorld,
 } from './canvas.js';
 
-const STORAGE_KEY = 'chimeworks_32bit_state_v1';
+const STORAGE_KEY = 'chimeworks_32bit_state_v2';
 const TEMPOS = [0.5, 1.0, 1.5];
 const LAYER_KEYS = ['b', 'p', 'm'];
 const LAYER_NAMES = ['bass', 'perc', 'mel'];
+const TRAJ_MAX_PTS = 90;
+const TRAJ_LAYER_STRIDE = 1 + TRAJ_MAX_PTS * 2; // 181 f32s per layer
 const IS_MOBILE = window.matchMedia('(pointer: coarse)').matches || /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
 
+/**
+ * Musical default seed: clean 4/4 groove with spatial Y-pitch bells (-1)
+ * positioned directly along parabolic flight paths so it sounds good on first click.
+ */
 function createSeedGenome() {
   return {
-    s: 0, // 0 = Pentatonic, 1 = Lydian
+    s: 0, // 0 = Pentatonic (Cmaj9->Am9->Fmaj9->G6), 1 = Lydian (Cmaj7#11->D/C->Bm7->Em9)
     b: {
-      e: [28, 18, 108, 48, 60, 0],
+      e: [26, 108, 12, 82, 72, 0],
       p: [
-        [0, 44, 68, 24, 22, 0, 0],
-        [3, 74, 106, 0, 10, 0, 0],
-        [3, 110, 128, 0, 10, 4, 0],
+        [3, 52, 134, 0, 10, -1, 0],
+        [3, 94, 128, 0, 10, -1, 0],
       ],
     },
     p: {
-      e: [80, 16, 90, 62, 30, 0],
+      e: [24, 64, 10, 86, 48, 0],
       p: [
-        [1, 80, 62, 0, 10, 0, 0],
-        [0, 56, 98, 32, 20, 0, 0],
-        [3, 106, 118, 0, 9, 2, 0],
+        [1, 52, 90, 0, 9, 0, 0],   // Kick
+        [1, 96, 86, 0, 9, 2, 0],   // Brushed snare
+        [1, 132, 84, 0, 8, 3, 0],  // Soft shaker
       ],
     },
     m: {
-      e: [132, 18, 72, 56, 20, 0],
+      e: [22, 22, 12, 88, 36, 0],
       p: [
-        [2, 118, 60, 0, 8, 1, 0],
-        [2, 42, 46, 0, 8, 0, 0],
-        [3, 56, 92, 0, 9, 7, 0],
-        [3, 98, 122, 0, 9, 11, 0],
+        [3, 44, 42, 0, 9, -1, 0],
+        [3, 72, 46, 0, 9, -1, 0],
+        [3, 104, 38, 0, 9, -1, 0],
+        [3, 132, 48, 0, 9, -1, 0],
       ],
     },
   };
@@ -83,6 +88,7 @@ const state = {
   tempoIdx: 1,
   muted: false,
   soloSlot: 'parent', // 'parent' | 0 | 1 | 2 | 3
+  activeLayer: 'm',   // 'b' | 'p' | 'm' — focused layer for trajectory highlight & +BELL/+RAMP/+BUMP
   layerModes: { bass: 'active', perc: 'active', mel: 'active' }, // 'active' | 'muted' | 'locked'
   parentGenome: createSeedGenome(),
   offspring: [
@@ -94,8 +100,11 @@ const state = {
   history: [],
   commissions: { chimes: false, marimba: false, fmBass: false, percussion: false },
   liveDroplets: null,
+  liveTrajectories: null,
   bellFlashes: new Map(),
   selectedPart: null,
+  isDraggingPart: false,
+  dragDeleting: false,
   encodeProgress: 0,
   pendingMp3Blob: null,
   spinAngle: 0,
@@ -113,6 +122,9 @@ const el = {
   powerBtn: document.getElementById('power-btn'),
   vinylPlatter: document.getElementById('vinyl-platter'),
   vinylBtn: document.getElementById('vinyl-btn'),
+  addBellBtn: document.getElementById('add-bell-btn'),
+  addRampBtn: document.getElementById('add-ramp-btn'),
+  addBumpBtn: document.getElementById('add-bump-btn'),
   scaleBtn: document.getElementById('scale-btn'),
   mutateBtn: document.getElementById('mutate-btn'),
   genomeBytes: document.getElementById('genome-bytes'),
@@ -230,6 +242,7 @@ function updateBreadcrumbs() {
     btn.addEventListener('click', () => {
       state.parentGenome = cloneGenome(g);
       state.soloSlot = 'parent';
+      state.selectedPart = null;
       syncAllUI();
       reloadSoloedPhysics();
       requestOffspringRollouts();
@@ -285,6 +298,10 @@ function syncAllUI() {
   el.ledPerc.dataset.mode = state.layerModes.perc;
   el.ledMel.dataset.mode = state.layerModes.mel;
 
+  el.ledBass.classList.toggle('edit-focus', state.activeLayer === 'b');
+  el.ledPerc.classList.toggle('edit-focus', state.activeLayer === 'p');
+  el.ledMel.classList.toggle('edit-focus', state.activeLayer === 'm');
+
   for (const key of ['parent', 0, 1, 2, 3]) {
     el.frames[key].classList.toggle('soloed', String(state.soloSlot) === String(key));
   }
@@ -332,13 +349,17 @@ physicsWorker.onmessage = (e) => {
       requestOffspringRollouts(false);
     }
     reloadSoloedPhysics();
-    // Rollout parent barcode too
     physicsWorker.postMessage({
       type: 'rolloutChamber',
       slot: 'parent',
       genome: state.parentGenome,
       layerMuted: getLayerMutedArr(),
     });
+    return;
+  }
+
+  if (msg.type === 'trajectories') {
+    state.liveTrajectories = msg.trajectories;
     return;
   }
 
@@ -453,6 +474,45 @@ function handleFirstTapUnlock() {
 
 window.addEventListener('pointerdown', handleFirstTapUnlock, { once: true });
 
+// ---------- Spawn Part Directly Along Active Trajectory ----------
+function spawnPartOnActiveLayer(kind) {
+  const genome = getSoloGenome();
+  const lk = state.activeLayer;
+  const li = LAYER_KEYS.indexOf(lk);
+  const layer = genome[lk];
+
+  // Pick a point directly on the active layer's traced trajectory so it plays immediately
+  let sx = 80;
+  let sy = 80;
+  if (state.liveTrajectories && state.liveTrajectories.length >= 3 * TRAJ_LAYER_STRIDE) {
+    const base = li * TRAJ_LAYER_STRIDE;
+    const count = Math.min(TRAJ_MAX_PTS, Math.floor(state.liveTrajectories[base]));
+    if (count > 6) {
+      const idx = Math.min(count - 2, Math.max(4, Math.floor(count * (0.28 + (layer.p.length % 4) * 0.16))));
+      sx = Math.max(20, Math.min(140, Math.round(state.liveTrajectories[base + 1 + idx * 2])));
+      sy = Math.max(26, Math.min(138, Math.round(state.liveTrajectories[base + 1 + idx * 2 + 1])));
+    }
+  }
+
+  // [kind, x, y, angle, size, param (-1 = spatial Y pitch), muted]
+  const newPart = kind === 0
+    ? [0, sx, sy, 20, 18, 0, 0]
+    : kind === 1
+      ? [1, sx, sy, 0, 9, -1, 0]
+      : [3, sx, sy, 0, 9, -1, 0];
+
+  layer.p.push(newPart);
+  if (JSON.stringify(genome).length >= 400) {
+    layer.p.pop();
+    return;
+  }
+
+  state.selectedPart = { layerKey: lk, isEmitter: false, index: layer.p.length - 1 };
+  syncAllUI();
+  reloadSoloedPhysics();
+  saveLocal();
+}
+
 // ---------- Top Bar & Parent Controls ----------
 el.tempoDial.addEventListener('click', () => {
   state.tempoIdx = (state.tempoIdx + 1) % TEMPOS.length;
@@ -467,6 +527,10 @@ el.powerBtn.addEventListener('click', () => {
   syncAllUI();
 });
 
+el.addBellBtn.addEventListener('click', () => spawnPartOnActiveLayer(3));
+el.addRampBtn.addEventListener('click', () => spawnPartOnActiveLayer(0));
+el.addBumpBtn.addEventListener('click', () => spawnPartOnActiveLayer(1));
+
 el.scaleBtn.addEventListener('click', () => {
   state.parentGenome.s = state.parentGenome.s === 0 ? 1 : 0;
   syncAllUI();
@@ -479,7 +543,8 @@ el.mutateBtn.addEventListener('click', () => {
   requestOffspringRollouts(false);
 });
 
-function cycleLayerLed(layerName) {
+function cycleLayerLed(layerName, layerKey) {
+  state.activeLayer = layerKey;
   const cur = state.layerModes[layerName];
   const next = cur === 'active' ? 'muted' : cur === 'muted' ? 'locked' : 'active';
   state.layerModes[layerName] = next;
@@ -491,9 +556,9 @@ function cycleLayerLed(layerName) {
   saveLocal();
 }
 
-el.ledBass.addEventListener('click', () => cycleLayerLed('bass'));
-el.ledPerc.addEventListener('click', () => cycleLayerLed('perc'));
-el.ledMel.addEventListener('click', () => cycleLayerLed('mel'));
+el.ledBass.addEventListener('click', () => cycleLayerLed('bass', 'b'));
+el.ledPerc.addEventListener('click', () => cycleLayerLed('perc', 'p'));
+el.ledMel.addEventListener('click', () => cycleLayerLed('mel', 'm'));
 
 el.vinylBtn.addEventListener('click', () => {
   if (state.mode === 'idle' || state.mode === 'encoding') return;
@@ -570,7 +635,7 @@ el.importFile.addEventListener('change', async (e) => {
   el.importFile.value = '';
 });
 
-// ---------- Interactive Part Tweaking (Parent + Soloed Chamber) ----------
+// ---------- Interactive Part Tweaking (Spatial Pitch, Aiming Arcs & Edge-to-Delete) ----------
 let dragPart = null;
 let lastTap = { time: 0, key: '' };
 
@@ -586,8 +651,11 @@ function bindChamberCanvasInteraction(slotKey, canvas) {
 
     e.stopPropagation();
     canvas.setPointerCapture(e.pointerId);
+    state.activeLayer = hit.layerKey;
+    syncAllUI();
 
     if (hit.type === 'rotate') {
+      state.isDraggingPart = true;
       dragPart = { slotKey, mode: 'rotate', layerKey: hit.layerKey, isEmitter: hit.isEmitter, index: hit.index };
       return;
     }
@@ -610,6 +678,8 @@ function bindChamberCanvasInteraction(slotKey, canvas) {
     lastTap = { time: now, key: tapKey };
 
     state.selectedPart = { layerKey: hit.layerKey, isEmitter: hit.isEmitter, index: hit.index };
+    state.isDraggingPart = true;
+    state.dragDeleting = false;
     dragPart = { slotKey, mode: 'move', layerKey: hit.layerKey, isEmitter: hit.isEmitter, index: hit.index };
   });
 
@@ -622,14 +692,22 @@ function bindChamberCanvasInteraction(slotKey, canvas) {
 
     const pt = clientToWorld(canvas, e.clientX, e.clientY);
     if (dragPart.mode === 'move') {
-      const nx = Math.max(16, Math.min(144, Math.round(pt.x)));
-      const ny = Math.max(16, Math.min(144, Math.round(pt.y)));
+      // Check edge-to-delete for non-emitter parts
+      const nearEdge = !dragPart.isEmitter && (pt.x < 8 || pt.x > 152 || pt.y < 8 || pt.y > 152);
+      state.dragDeleting = nearEdge;
+
+      const nx = Math.max(14, Math.min(146, Math.round(pt.x)));
+      const ny = Math.max(14, Math.min(146, Math.round(pt.y)));
       if (dragPart.isEmitter) {
         target[0] = nx;
         target[1] = ny;
       } else {
         target[1] = nx;
         target[2] = ny;
+        // Enable spatial Y-height tuning automatically when dragging bells/bumpers
+        if (target[0] === 3 || target[0] === 1) {
+          target[5] = -1;
+        }
       }
     } else if (dragPart.mode === 'rotate') {
       const tx = dragPart.isEmitter ? target[0] : target[1];
@@ -643,7 +721,19 @@ function bindChamberCanvasInteraction(slotKey, canvas) {
 
   const endDrag = () => {
     if (dragPart && String(dragPart.slotKey) === String(slotKey)) {
+      if (state.dragDeleting && !dragPart.isEmitter) {
+        const genome = getSoloGenome();
+        const layer = genome[dragPart.layerKey];
+        if (layer && layer.p[dragPart.index]) {
+          layer.p.splice(dragPart.index, 1);
+          state.selectedPart = null;
+          reloadSoloedPhysics();
+        }
+      }
       dragPart = null;
+      state.isDraggingPart = false;
+      state.dragDeleting = false;
+      syncAllUI();
       saveLocal();
     }
   };
@@ -688,7 +778,6 @@ function crossPollinate(fromSlot, targetSlot) {
   const donor = state.offspring[fromSlot].genome;
   const recipient = targetSlot === 'parent' ? state.parentGenome : state.offspring[targetSlot].genome;
 
-  // Pick an intact unlocked layer to swap from donor into recipient
   const candidates = [];
   for (let i = 0; i < 3; i++) {
     if (targetSlot === 'parent' && state.layerModes[LAYER_NAMES[i]] === 'locked') continue;
@@ -699,7 +788,6 @@ function crossPollinate(fromSlot, targetSlot) {
   const chosen = candidates[(state.generation + fromSlot) % candidates.length];
   recipient[chosen] = JSON.parse(JSON.stringify(donor[chosen]));
 
-  // Keep <400-byte genome invariant
   while (JSON.stringify(recipient).length >= 400 && recipient[chosen].p.length > 2) {
     recipient[chosen].p.pop();
   }
@@ -748,7 +836,6 @@ for (let slot = 0; slot < 4; slot++) {
     if (dragged) {
       state.ghost.x = e.clientX;
       state.ghost.y = e.clientY;
-      // Highlight drop target
       for (const k of ['parent', 0, 1, 2, 3]) {
         const r = el.frames[k].getBoundingClientRect();
         const over = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
@@ -815,7 +902,6 @@ function loop(now) {
   if (state.mode === 'complete') {
     const elapsed = Math.min(120, now - state.tonearmStartMs);
     const u = elapsed / 120;
-    // Underdamped spring settling smoothly at u = 1 (120ms)
     state.tonearmSpring = 1 - Math.exp(-6 * u) * Math.cos(Math.PI * 2.2 * u);
   } else {
     state.tonearmSpring = 0;
@@ -827,18 +913,24 @@ function loop(now) {
   // Render Parent + 4 Offspring chambers
   const isIdle = state.mode === 'idle';
   const oscData = isIdle ? null : audio.getOscilloscopeData();
+  const chordName = isIdle ? null : audio.getCurrentChordName(getSoloGenome().s);
 
   renderChamber(el.canvases.parent, {
     genome: state.parentGenome,
     isIdle,
     isSoloed: state.soloSlot === 'parent',
     layerModes: state.layerModes,
+    activeLayer: state.activeLayer,
     droplets: state.soloSlot === 'parent' ? state.liveDroplets : null,
     keyframes: null,
     kfFrame: 0,
     barcode: null,
+    trajectories: state.soloSlot === 'parent' ? state.liveTrajectories : null,
     bellFlashes: state.soloSlot === 'parent' ? state.bellFlashes : null,
     selectedPart: state.soloSlot === 'parent' ? state.selectedPart : null,
+    isDragging: state.isDraggingPart,
+    dragDeleting: state.dragDeleting,
+    chordName: state.soloSlot === 'parent' ? chordName : null,
     oscData: state.soloSlot === 'parent' ? oscData : null,
   });
 
@@ -849,12 +941,17 @@ function loop(now) {
       isIdle,
       isSoloed,
       layerModes: null,
+      activeLayer: state.activeLayer,
       droplets: isSoloed ? state.liveDroplets : null,
       keyframes: isSoloed ? null : state.offspring[i].keyframes,
       kfFrame: Math.floor(kfTick),
       barcode: isSoloed ? null : state.offspring[i].barcode,
+      trajectories: isSoloed ? state.liveTrajectories : null,
       bellFlashes: isSoloed ? state.bellFlashes : null,
       selectedPart: isSoloed ? state.selectedPart : null,
+      isDragging: isSoloed ? state.isDraggingPart : false,
+      dragDeleting: isSoloed ? state.dragDeleting : false,
+      chordName: isSoloed ? chordName : null,
       oscData: isSoloed ? oscData : null,
     });
   }
